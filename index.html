@@ -13,7 +13,7 @@
       height: 100%;
       margin: 0;
       overflow: hidden;
-      background: #8ed2ff;
+      background: #000000;
       font-family: Arial, "Malgun Gothic", sans-serif;
     }
 
@@ -22,6 +22,7 @@
       display: block;
       width: 100%;
       height: 100%;
+      background: #000000;
       touch-action: none;
       cursor: pointer;
     }
@@ -46,14 +47,24 @@
     const START_SPEED = 0.31;
     const SPEED_STEP = 0.022;
     const MAX_SPEED = 0.60;
+    // 게임 내부는 언제나 이 고정 논리 해상도를 기준으로 계산한다.
+    const LOGICAL_WIDTH = 480;
+    const LOGICAL_HEIGHT = 800;
+    const GRAVITY = 1800;
+    const GROUND_BOUNCE = 0.28;
+    const PIECE_FADE_SECONDS = 0.45;
 
     let viewWidth = 0;
     let viewHeight = 0;
     let pixelRatio = 1;
+    let displayScale = 1;
+    let displayOffsetX = 0;
+    let displayOffsetY = 0;
     let blockHeight = 0;
     let gameState = 'ready';
     let stack = [];
     let movingBlock = null;
+    let fallingPieces = [];
     let score = 0;
     let combo = 0;
     let lastFrameTime = 0;
@@ -64,16 +75,29 @@
       return Math.max(minimum, Math.min(maximum, value));
     }
 
-    // 화면의 실제 픽셀 수와 CSS 표시 크기를 맞춘다.
+    // 캔버스는 창 전체를 쓰되, 게임 내부 좌표는 고정 논리 해상도로 유지한다.
     function resizeCanvas() {
       const rect = canvas.getBoundingClientRect();
-      viewWidth = Math.max(1, rect.width);
-      viewHeight = Math.max(1, rect.height);
-      pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-      canvas.width = Math.round(viewWidth * pixelRatio);
-      canvas.height = Math.round(viewHeight * pixelRatio);
-      // 내부 해상도는 높이고, 이후의 그림 좌표는 CSS 픽셀 기준으로 유지한다.
-      ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      const canvasWidth = Math.max(1, rect.width);
+      const canvasHeight = Math.max(1, rect.height);
+      pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.round(canvasWidth * pixelRatio);
+      canvas.height = Math.round(canvasHeight * pixelRatio);
+
+      viewWidth = LOGICAL_WIDTH;
+      viewHeight = LOGICAL_HEIGHT;
+      displayScale = Math.min(canvasWidth / viewWidth, canvasHeight / viewHeight);
+      displayOffsetX = (canvasWidth - viewWidth * displayScale) / 2;
+      displayOffsetY = (canvasHeight - viewHeight * displayScale) / 2;
+      // 고정 논리 화면을 현재 창 중앙에 같은 비율로 그린다.
+      ctx.setTransform(
+        pixelRatio * displayScale,
+        0,
+        0,
+        pixelRatio * displayScale,
+        pixelRatio * displayOffsetX,
+        pixelRatio * displayOffsetY
+      );
       blockHeight = Math.max(24, viewHeight * BLOCK_HEIGHT_RATIO);
     }
 
@@ -81,6 +105,7 @@
     function resetGame() {
       score = 0;
       combo = 0;
+      fallingPieces = [];
       stack = [{
         x: (1 - MAX_BLOCK_WIDTH) / 2,
         width: MAX_BLOCK_WIDTH,
@@ -93,7 +118,9 @@
     // 직전 블록 바로 위에 다음 블록을 만든다.
     function createMovingBlock() {
       const below = stack[stack.length - 1];
-      const fromLeft = stack.length % 2 === 1;
+      // 매번 왼쪽 또는 오른쪽 출발을 무작위로 고른다.
+      // 같은 방향이 연속해서 선택될 수도 있다.
+      const fromLeft = Math.random() < 0.5;
       const minX = SIDE_PADDING;
       const maxX = 1 - SIDE_PADDING - below.width;
 
@@ -115,20 +142,58 @@
 
     // 움직이는 블록의 위치를 한 프레임만큼 갱신한다.
     function update(deltaSeconds) {
-      if (gameState !== 'playing' || !movingBlock) return;
+      if (gameState === 'playing' && movingBlock) {
+        const minX = SIDE_PADDING;
+        const maxX = 1 - SIDE_PADDING - movingBlock.width;
+        movingBlock.x += movingBlock.direction * movingBlock.speed * deltaSeconds;
 
-      const minX = SIDE_PADDING;
-      const maxX = 1 - SIDE_PADDING - movingBlock.width;
-      movingBlock.x += movingBlock.direction * movingBlock.speed * deltaSeconds;
-
-      // 경계를 넘긴 양까지 반영해 부드럽게 반대편으로 되돌린다.
-      if (movingBlock.x > maxX) {
-        movingBlock.x = maxX - (movingBlock.x - maxX);
-        movingBlock.direction = -1;
-      } else if (movingBlock.x < minX) {
-        movingBlock.x = minX + (minX - movingBlock.x);
-        movingBlock.direction = 1;
+        // 경계를 넘긴 양까지 반영해 부드럽게 반대편으로 되돌린다.
+        if (movingBlock.x > maxX) {
+          movingBlock.x = maxX - (movingBlock.x - maxX);
+          movingBlock.direction = -1;
+        } else if (movingBlock.x < minX) {
+          movingBlock.x = minX + (minX - movingBlock.x);
+          movingBlock.direction = 1;
+        }
       }
+
+      // 잘려 나간 조각과 실패한 블록은 중력으로 바닥까지 떨어진다.
+      const groundY = getGroundY();
+      for (const piece of fallingPieces) {
+        piece.velocityY += GRAVITY * deltaSeconds;
+        piece.y += piece.velocityY * deltaSeconds;
+        piece.x += piece.velocityX * deltaSeconds;
+
+        // 바닥에 닿으면 한 번 작게 튀긴 뒤, 멈춘 조각은 천천히 사라진다.
+        if (piece.y + blockHeight >= groundY) {
+          piece.y = groundY - blockHeight;
+          if (piece.bounceCount === 0 && piece.velocityY > 250) {
+            piece.velocityY = -piece.velocityY * GROUND_BOUNCE;
+            piece.velocityX *= 0.55;
+            piece.bounceCount += 1;
+          } else {
+            piece.velocityY = 0;
+            piece.velocityX *= 0.82;
+            piece.settledTime += deltaSeconds;
+          }
+        }
+      }
+      fallingPieces = fallingPieces.filter((piece) => piece.settledTime < PIECE_FADE_SECONDS);
+    }
+
+    // 잘린 블록 부분을 떨어지는 조각으로 등록한다.
+    function addFallingPiece(x, width, level, color, direction) {
+      if (width <= 0) return;
+      fallingPieces.push({
+        x,
+        width,
+        y: getScreenY(level),
+        velocityX: direction * viewWidth * 0.12,
+        velocityY: viewHeight * 0.05,
+        color,
+        bounceCount: 0,
+        settledTime: 0
+      });
     }
 
     // 현재 블록을 멈추고, 아래 블록과 얼마나 겹쳤는지 계산한다.
@@ -145,13 +210,23 @@
 
       // 겹친 폭이 없으면 더 이상 새 블록을 만들지 않는다.
       if (overlapWidth <= 0) {
+        addFallingPiece(
+          movingBlock.x,
+          movingBlock.width,
+          movingBlock.level,
+          movingBlock.color,
+          movingBlock.direction
+        );
+        movingBlock = null;
         gameState = 'gameover';
         return;
       }
 
       if (centerDifference <= PERFECT_TOLERANCE) {
-        // 퍼펙트는 먼저 중심을 정확히 정렬한 뒤 최대 폭으로 복구한다.
-        movingBlock.width = MAX_BLOCK_WIDTH;
+        // 퍼펙트는 중심을 맞춘 뒤 두 단계 아래 블록의 폭으로 복구한다.
+        // 첫 적층처럼 두 단계 아래 블록이 없으면 바닥 블록을 사용한다.
+        const restoreBlock = stack[Math.max(0, stack.length - 2)];
+        movingBlock.width = restoreBlock.width;
         movingBlock.x = clamp(
           belowCenter - movingBlock.width / 2,
           SIDE_PADDING,
@@ -159,7 +234,25 @@
         );
         combo += 1;
       } else {
-        // 일반 적층은 겹쳐 있는 부분만 남긴다.
+        // 일반 적층은 겹쳐 있는 부분만 남기고 나머지를 떨어뜨린다.
+        if (movingBlock.x < overlapLeft) {
+          addFallingPiece(
+            movingBlock.x,
+            overlapLeft - movingBlock.x,
+            movingBlock.level,
+            movingBlock.color,
+            -1
+          );
+        }
+        if (movingBlock.x + movingBlock.width > overlapRight) {
+          addFallingPiece(
+            overlapRight,
+            movingBlock.x + movingBlock.width - overlapRight,
+            movingBlock.level,
+            movingBlock.color,
+            1
+          );
+        }
         movingBlock.x = overlapLeft;
         movingBlock.width = overlapWidth;
         combo = 0;
@@ -195,6 +288,11 @@
       return floorY - (level - cameraLevel) * blockHeight;
     }
 
+    // 바닥 블록의 바로 아래를 떨어지는 조각의 충돌 바닥으로 사용한다.
+    function getGroundY() {
+      return viewHeight * 0.88 + blockHeight;
+    }
+
     // 둥근 모서리 블록을 그린다.
     function drawBlock(block, isMoving) {
       const x = block.x * viewWidth;
@@ -219,6 +317,19 @@
       }
     }
 
+    // 잘린 조각은 화면 y 좌표를 직접 사용해 떨어지는 모습을 그린다.
+    function drawFallingPiece(piece) {
+      const x = piece.x * viewWidth;
+      const width = piece.width * viewWidth;
+      const radius = Math.min(8, blockHeight * 0.18, width * 0.12);
+      ctx.globalAlpha = 1 - piece.settledTime / PIECE_FADE_SECONDS;
+      ctx.fillStyle = piece.color;
+      ctx.beginPath();
+      ctx.roundRect(x, piece.y, width, blockHeight, radius);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
     // 텍스트를 화면 중앙에 그리는 도우미 함수다.
     function drawCenteredText(text, y, size, color) {
       ctx.fillStyle = color;
@@ -230,6 +341,20 @@
 
     // 배경과 모든 게임 요소를 매 프레임 다시 그린다.
     function render() {
+      // 게임 화면 밖의 여백은 항상 검은색으로 지운다.
+      // 논리 화면 변환을 잠시 해제해 캔버스 전체를 채운다.
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+
+      // 이후 모든 그림은 고정 논리 게임 화면 안에서만 보이게 제한한다.
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, viewWidth, viewHeight);
+      ctx.clip();
+
       const background = ctx.createLinearGradient(0, 0, 0, viewHeight);
       background.addColorStop(0, '#72c7fa');
       background.addColorStop(1, '#d9f3ff');
@@ -246,6 +371,9 @@
       if (movingBlock) {
         drawBlock(movingBlock, true);
       }
+      for (const piece of fallingPieces) {
+        drawFallingPiece(piece);
+      }
 
       // 프로토타입 검증에 필요한 최소 정보만 표시한다.
       drawCenteredText(`점수 ${score}`, viewHeight * 0.08, Math.max(22, viewWidth * 0.065), '#17324d');
@@ -260,6 +388,9 @@
         drawCenteredText(`최종 점수 ${score}`, viewHeight * 0.49, Math.max(18, viewWidth * 0.052), '#ffffff');
         drawCenteredText('탭하거나 스페이스바를 눌러 다시 시작', viewHeight * 0.57, Math.max(14, viewWidth * 0.04), '#ffffff');
       }
+
+      // 클리핑 범위를 해제해 다음 프레임에도 같은 상태로 시작한다.
+      ctx.restore();
     }
 
     // 브라우저가 다음 그림을 요청할 때마다 게임을 갱신하고 다시 그린다.
